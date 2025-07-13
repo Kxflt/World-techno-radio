@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, HTTPException
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -6,9 +6,11 @@ import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Optional
 import uuid
 from datetime import datetime
+import aiohttp
+import asyncio
 
 
 ROOT_DIR = Path(__file__).parent
@@ -27,30 +29,180 @@ api_router = APIRouter(prefix="/api")
 
 
 # Define Models
-class StatusCheck(BaseModel):
+class RadioStation(BaseModel):
+    stationuuid: str
+    name: str
+    url: str
+    homepage: Optional[str] = None
+    favicon: Optional[str] = None
+    tags: str
+    country: str
+    language: str
+    bitrate: int
+    codec: str
+    votes: Optional[int] = 0
+    clickcount: Optional[int] = 0
+    lastchangetime: Optional[str] = None
+
+class FavoriteStation(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    stationuuid: str
+    name: str
+    url: str
+    country: str
+    tags: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
 
-class StatusCheckCreate(BaseModel):
-    client_name: str
 
-# Add your routes to the router instead of directly to app
+# Radio Browser API functions
+async def fetch_radio_stations(tag: str = "electronic", limit: int = 50):
+    """Fetch radio stations from Radio Browser API"""
+    try:
+        base_url = "https://api.radio-browser.info/json/stations/bytag"
+        url = f"{base_url}/{tag}?limit={limit}&hidebroken=true&order=clickcount&reverse=true"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    # Filter for high-quality stations
+                    filtered_stations = [
+                        station for station in data 
+                        if station.get('bitrate', 0) >= 128 and station.get('url')
+                    ]
+                    return filtered_stations[:limit]
+                else:
+                    logger.error(f"Failed to fetch stations: {response.status}")
+                    return []
+    except Exception as e:
+        logger.error(f"Error fetching radio stations: {e}")
+        return []
+
+async def search_radio_stations(query: str, limit: int = 30):
+    """Search radio stations by name"""
+    try:
+        base_url = "https://api.radio-browser.info/json/stations/byname"
+        url = f"{base_url}/{query}?limit={limit}&hidebroken=true&order=clickcount&reverse=true"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    # Filter for electronic music stations
+                    electronic_stations = [
+                        station for station in data 
+                        if any(genre in station.get('tags', '').lower() 
+                              for genre in ['electronic', 'techno', 'house', 'trance', 'dance', 'edm'])
+                        and station.get('bitrate', 0) >= 128
+                    ]
+                    return electronic_stations[:limit]
+                else:
+                    logger.error(f"Failed to search stations: {response.status}")
+                    return []
+    except Exception as e:
+        logger.error(f"Error searching radio stations: {e}")
+        return []
+
+
+# API Routes
 @api_router.get("/")
 async def root():
-    return {"message": "Hello World"}
+    return {"message": "World Techno Radio API"}
 
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.dict()
-    status_obj = StatusCheck(**status_dict)
-    _ = await db.status_checks.insert_one(status_obj.dict())
-    return status_obj
+@api_router.get("/stations/{genre}")
+async def get_stations_by_genre(genre: str):
+    """Get radio stations by genre (electronic, techno, house, trance, etc.)"""
+    try:
+        stations = await fetch_radio_stations(genre)
+        return {"stations": stations, "count": len(stations)}
+    except Exception as e:
+        logger.error(f"Error getting stations by genre: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch stations")
 
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    status_checks = await db.status_checks.find().to_list(1000)
-    return [StatusCheck(**status_check) for status_check in status_checks]
+@api_router.get("/stations")
+async def get_all_electronic_stations():
+    """Get all electronic music stations"""
+    try:
+        # Fetch different electronic genres
+        genres = ["electronic", "techno", "house", "trance", "dance", "edm"]
+        all_stations = []
+        
+        for genre in genres:
+            stations = await fetch_radio_stations(genre, limit=20)
+            all_stations.extend(stations)
+        
+        # Remove duplicates based on stationuuid
+        seen = set()
+        unique_stations = []
+        for station in all_stations:
+            if station.get('stationuuid') not in seen:
+                seen.add(station.get('stationuuid'))
+                unique_stations.append(station)
+        
+        # Sort by clickcount (popularity)
+        unique_stations.sort(key=lambda x: x.get('clickcount', 0), reverse=True)
+        
+        return {"stations": unique_stations[:100], "count": len(unique_stations[:100])}
+    except Exception as e:
+        logger.error(f"Error getting all stations: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch stations")
+
+@api_router.get("/search/{query}")
+async def search_stations(query: str):
+    """Search for radio stations by name"""
+    try:
+        stations = await search_radio_stations(query)
+        return {"stations": stations, "count": len(stations)}
+    except Exception as e:
+        logger.error(f"Error searching stations: {e}")
+        raise HTTPException(status_code=500, detail="Failed to search stations")
+
+@api_router.post("/favorites")
+async def add_favorite_station(station_data: dict):
+    """Add a station to favorites"""
+    try:
+        favorite = FavoriteStation(
+            stationuuid=station_data["stationuuid"],
+            name=station_data["name"],
+            url=station_data["url"],
+            country=station_data.get("country", ""),
+            tags=station_data.get("tags", "")
+        )
+        
+        # Check if already in favorites
+        existing = await db.favorites.find_one({"stationuuid": favorite.stationuuid})
+        if existing:
+            return {"message": "Station already in favorites", "favorite": existing}
+        
+        await db.favorites.insert_one(favorite.dict())
+        return {"message": "Station added to favorites", "favorite": favorite}
+    except Exception as e:
+        logger.error(f"Error adding favorite: {e}")
+        raise HTTPException(status_code=500, detail="Failed to add favorite")
+
+@api_router.get("/favorites")
+async def get_favorite_stations():
+    """Get all favorite stations"""
+    try:
+        favorites = await db.favorites.find().sort("created_at", -1).to_list(100)
+        return {"favorites": favorites, "count": len(favorites)}
+    except Exception as e:
+        logger.error(f"Error getting favorites: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get favorites")
+
+@api_router.delete("/favorites/{stationuuid}")
+async def remove_favorite_station(stationuuid: str):
+    """Remove a station from favorites"""
+    try:
+        result = await db.favorites.delete_one({"stationuuid": stationuuid})
+        if result.deleted_count > 0:
+            return {"message": "Station removed from favorites"}
+        else:
+            raise HTTPException(status_code=404, detail="Station not found in favorites")
+    except Exception as e:
+        logger.error(f"Error removing favorite: {e}")
+        raise HTTPException(status_code=500, detail="Failed to remove favorite")
+
 
 # Include the router in the main app
 app.include_router(api_router)
