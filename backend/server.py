@@ -54,22 +54,61 @@ class FavoriteStation(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
+# Radio Browser API server discovery
+async def get_radio_browser_servers():
+    """Get available Radio Browser API servers"""
+    try:
+        # Try multiple known servers
+        servers = [
+            "https://de1.api.radio-browser.info",
+            "https://at1.api.radio-browser.info", 
+            "https://nl1.api.radio-browser.info",
+            "https://fr1.api.radio-browser.info"
+        ]
+        
+        # Test each server and return the first working one
+        for server in servers:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(f"{server}/json/stations", timeout=5) as response:
+                        if response.status == 200:
+                            logger.info(f"Using Radio Browser server: {server}")
+                            return server
+            except:
+                continue
+        
+        # Fallback to default if all fail
+        logger.warning("All Radio Browser servers failed, using default")
+        return "https://at1.api.radio-browser.info"
+    except Exception as e:
+        logger.error(f"Error getting Radio Browser servers: {e}")
+        return "https://at1.api.radio-browser.info"
+
 # Radio Browser API functions
 async def fetch_radio_stations(tag: str = "electronic", limit: int = 50):
     """Fetch radio stations from Radio Browser API"""
     try:
-        base_url = "https://api.radio-browser.info/json/stations/bytag"
-        url = f"{base_url}/{tag}?limit={limit}&hidebroken=true&order=clickcount&reverse=true"
+        server = await get_radio_browser_servers()
+        
+        # Use the stations endpoint with tag filter
+        url = f"{server}/json/stations/bytag/{tag}"
+        params = {
+            'limit': limit,
+            'hidebroken': 'true',
+            'order': 'clickcount',
+            'reverse': 'true'
+        }
         
         async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
+            async with session.get(url, params=params, timeout=10) as response:
                 if response.status == 200:
                     data = await response.json()
                     # Filter for high-quality stations
                     filtered_stations = [
                         station for station in data 
-                        if station.get('bitrate', 0) >= 128 and station.get('url')
+                        if station.get('bitrate', 0) >= 64 and station.get('url') and station.get('url_resolved')
                     ]
+                    logger.info(f"Found {len(filtered_stations)} stations for tag '{tag}'")
                     return filtered_stations[:limit]
                 else:
                     logger.error(f"Failed to fetch stations: {response.status}")
@@ -81,11 +120,19 @@ async def fetch_radio_stations(tag: str = "electronic", limit: int = 50):
 async def search_radio_stations(query: str, limit: int = 30):
     """Search radio stations by name"""
     try:
-        base_url = "https://api.radio-browser.info/json/stations/byname"
-        url = f"{base_url}/{query}?limit={limit}&hidebroken=true&order=clickcount&reverse=true"
+        server = await get_radio_browser_servers()
+        
+        # Use the stations endpoint with name filter
+        url = f"{server}/json/stations/byname/{query}"
+        params = {
+            'limit': limit,
+            'hidebroken': 'true',
+            'order': 'clickcount',
+            'reverse': 'true'
+        }
         
         async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
+            async with session.get(url, params=params, timeout=10) as response:
                 if response.status == 200:
                     data = await response.json()
                     # Filter for electronic music stations
@@ -93,8 +140,10 @@ async def search_radio_stations(query: str, limit: int = 30):
                         station for station in data 
                         if any(genre in station.get('tags', '').lower() 
                               for genre in ['electronic', 'techno', 'house', 'trance', 'dance', 'edm'])
-                        and station.get('bitrate', 0) >= 128
+                        and station.get('bitrate', 0) >= 64
+                        and station.get('url_resolved')
                     ]
+                    logger.info(f"Found {len(electronic_stations)} electronic stations for query '{query}'")
                     return electronic_stations[:limit]
                 else:
                     logger.error(f"Failed to search stations: {response.status}")
